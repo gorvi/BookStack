@@ -16,6 +16,8 @@ use Illuminate\Database\Query\JoinClause;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Log;
 use WeakMap;
 
 class SearchRunner
@@ -41,6 +43,24 @@ class SearchRunner
      */
     public function searchEntities(SearchOptions $searchOpts, string $entityType = 'all', int $page = 1, int $count = 20): array
     {
+        $startTime = microtime(true);
+        // Generate unique cache key based on search parameters and user
+        $cacheKey = 'search_' . md5(serialize($searchOpts) . $entityType . $page . $count . user()->id);
+        $cachedData = Cache::get($cacheKey);
+
+        if ($cachedData) {
+            // Retrieve entities from cache and hydrate
+            $entities = Entity::query()->whereIn('id', $cachedData['ids'])->get();
+            $results = collect($this->entityHydrator->hydrate($entities->all(), true, true));
+            $executionTime = microtime(true) - $startTime;
+            Log::info('Search executed from cache', [
+                'time_ms' => round($executionTime * 1000, 2),
+                'query' => $searchOpts->searches->toValueArray(),
+                'entity_type' => $entityType
+            ]);
+            return ['total' => $cachedData['total'], 'results' => $results->values()];
+        }
+
         $entityTypes = array_keys($this->entityProvider->all());
         $entityTypesToSearch = $entityTypes;
 
@@ -54,6 +74,19 @@ class SearchRunner
         $searchQuery = $this->buildQuery($searchOpts, $entityTypesToSearch);
         $total = $searchQuery->count();
         $results = $this->getPageOfDataFromQuery($searchQuery, $page, $count);
+
+        // Log database query performance
+        $executionTime = microtime(true) - $startTime;
+        Log::info('Search executed from database', [
+            'time_ms' => round($executionTime * 1000, 2),
+            'query' => $searchOpts->searches->toValueArray(),
+            'entity_type' => $entityType,
+            'results_count' => count($results)
+        ]);
+
+        // Store only IDs and total in cache for efficiency
+        $ids = $results->pluck('id')->toArray();
+        Cache::put($cacheKey, ['ids' => $ids, 'total' => $total], now()->addMinutes(15));
 
         return [
             'total'    => $total,
@@ -341,28 +374,40 @@ class SearchRunner
     protected function filterCreatedBy(EloquentBuilder $query, string $input, bool $negated)
     {
         $userSlug = $input === 'me' ? user()->slug : trim($input);
-        $user = User::query()->where('slug', '=', $userSlug)->first(['id']);
-        if ($user) {
-            $this->applyNegatableWhere($query, $negated, 'created_by', '=', $user->id);
-        }
+        $this->applyNegatableWhere($query, $negated, function(EloquentBuilder $q) use ($userSlug) {
+            $q->whereExists(function($sub) use ($userSlug) {
+                $sub->select(DB::raw(1))
+                    ->from('users')
+                    ->whereColumn('users.id', 'entities.created_by')
+                    ->where('users.slug', '=', $userSlug);
+            });
+        }, null, null);
     }
 
     protected function filterUpdatedBy(EloquentBuilder $query, string $input, bool $negated)
     {
         $userSlug = $input === 'me' ? user()->slug : trim($input);
-        $user = User::query()->where('slug', '=', $userSlug)->first(['id']);
-        if ($user) {
-            $this->applyNegatableWhere($query, $negated, 'updated_by', '=', $user->id);
-        }
+        $this->applyNegatableWhere($query, $negated, function(EloquentBuilder $q) use ($userSlug) {
+            $q->whereExists(function($sub) use ($userSlug) {
+                $sub->select(DB::raw(1))
+                    ->from('users')
+                    ->whereColumn('users.id', 'entities.updated_by')
+                    ->where('users.slug', '=', $userSlug);
+            });
+        }, null, null);
     }
 
     protected function filterOwnedBy(EloquentBuilder $query, string $input, bool $negated)
     {
         $userSlug = $input === 'me' ? user()->slug : trim($input);
-        $user = User::query()->where('slug', '=', $userSlug)->first(['id']);
-        if ($user) {
-            $this->applyNegatableWhere($query, $negated, 'owned_by', '=', $user->id);
-        }
+        $this->applyNegatableWhere($query, $negated, function(EloquentBuilder $q) use ($userSlug) {
+            $q->whereExists(function($sub) use ($userSlug) {
+                $sub->select(DB::raw(1))
+                    ->from('users')
+                    ->whereColumn('users.id', 'entities.owned_by')
+                    ->where('users.slug', '=', $userSlug);
+            });
+        }, null, null);
     }
 
     protected function filterInName(EloquentBuilder $query, string $input, bool $negated)
